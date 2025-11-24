@@ -8,7 +8,10 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from fpdf import FPDF
 import base64
-import re  # Importação para Regex (Segurança do Chat)
+import re
+
+# --- LIGAÇÃO AO BACKEND ---
+import db_manager as db
 
 # ==============================================================================
 # 1. CONFIGURAÇÃO E ESTILOS
@@ -57,7 +60,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 2. LÓGICA DE NEGÓCIO, PDF E SEGURANÇA (BLINDADO)
+# 2. LÓGICA DE NEGÓCIO E UTILITÁRIOS
 # ==============================================================================
 def validate_address(address):
     geolocator = Nominatim(user_agent="babyconnect_app_vfinal")
@@ -73,7 +76,7 @@ def get_distance_km(dest_coords):
     except: return None 
 
 def calcular_preco_total(babysitter_data, duracao_horas, location_obj):
-    preco_hora = babysitter_data['Preço/Hora']
+    preco_hora = babysitter_data.get('Preço/Hora') if isinstance(babysitter_data, dict) else babysitter_data['Preço/Hora']
     custo_servico = preco_hora * duracao_horas
     
     dest_coords = (location_obj.latitude, location_obj.longitude)
@@ -88,12 +91,25 @@ def calcular_preco_total(babysitter_data, duracao_horas, location_obj):
         "custo_deslocacao": custo_deslocacao, "total": total
     }
 
-def get_available_babysitters(date_selected):
-    df_agendas = st.session_state['agendamentos']
-    df_babas = st.session_state['babysitters']
-    ocupadas_no_dia = df_agendas[df_agendas['Data'] == date_selected]['Babysitter'].unique()
-    disponiveis = df_babas[~df_babas['Nome'].isin(ocupadas_no_dia)]
-    return disponiveis
+def calculate_time_remaining(booking_data):
+    """Calcula tempo restante e progresso baseando-se no check-in real"""
+    if not booking_data.get('check_in_time'): return 0, 0, "Não iniciado"
+    
+    start = booking_data['check_in_time'] 
+    duration_min = (booking_data['duration'] * 60) + booking_data.get('extension_minutes', 0)
+    end_time = start + timedelta(minutes=duration_min)
+    now = datetime.now()
+    
+    remaining = end_time - now
+    total_seconds = remaining.total_seconds()
+    
+    if total_seconds <= 0: return 0, 1.0, "Terminado"
+    
+    minutes_left = int(total_seconds / 60)
+    total_duration_sec = duration_min * 60
+    progress = 1.0 - (total_seconds / total_duration_sec)
+    
+    return minutes_left, progress, end_time.strftime('%H:%M')
 
 def create_pdf_invoice(service_data):
     pdf = FPDF()
@@ -105,10 +121,17 @@ def create_pdf_invoice(service_data):
     pdf.line(10, 30, 200, 30)
     pdf.ln(20)
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, f"Babysitter: {service_data['Babysitter']}", ln=True)
+    baba_nome = service_data.get('Babysitter') or service_data.get('BabysitterName') or "N/A"
+    cli_nome = service_data.get('Cliente') or service_data.get('ClientName') or st.session_state.get('user_name')
+    
+    pdf.cell(0, 10, f"Babysitter: {baba_nome}", ln=True)
     pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 10, f"Cliente: {service_data['Cliente']}", ln=True)
-    pdf.cell(0, 10, f"Data do Servico: {service_data['Data'].strftime('%d/%m/%Y')}", ln=True)
+    pdf.cell(0, 10, f"Cliente: {cli_nome}", ln=True)
+    
+    data_serv = service_data.get('Data') or service_data.get('service_date')
+    if not isinstance(data_serv, str): data_serv = data_serv.strftime('%d/%m/%Y')
+    
+    pdf.cell(0, 10, f"Data do Servico: {data_serv}", ln=True)
     local_str = str(service_data.get('Local', 'N/A')).encode('latin-1', 'replace').decode('latin-1')
     pdf.cell(0, 10, f"Local: {local_str}", ln=True)
     pdf.ln(10)
@@ -116,115 +139,38 @@ def create_pdf_invoice(service_data):
     pdf.cell(140, 10, "Descricao", 1, 0, 'L', 1)
     pdf.cell(50, 10, "Valor (EUR)", 1, 1, 'R', 1)
     pdf.cell(140, 10, "Servico de Babysitting + Deslocacao", 1, 0, 'L')
-    pdf.cell(50, 10, f"{service_data['Valor']:.2f}", 1, 1, 'R')
+    pdf.cell(50, 10, f"{service_data.get('Valor', 0):.2f}", 1, 1, 'R')
     pdf.set_font("Arial", "B", 12)
     pdf.cell(140, 10, "TOTAL", 1, 0, 'R')
-    pdf.cell(50, 10, f"{service_data['Valor']:.2f} EUR", 1, 1, 'R')
+    pdf.cell(50, 10, f"{service_data.get('Valor', 0):.2f} EUR", 1, 1, 'R')
     pdf.ln(20)
     pdf.set_font("Arial", "I", 10)
     pdf.cell(0, 10, "Obrigado pela preferencia!", ln=True, align="C")
     return pdf.output(dest='S').encode('latin-1')
 
 def check_safety_rules(text, history_context=""):
-    """
-    Verificação de Segurança Agressiva.
-    Analisa o texto atual + histórico recente para detetar padrões de contacto fragmentados.
-    """
-    # 1. Combina texto atual com histórico recente
     full_text = history_context + " " + text
-    
-    # 2. Emails
     if re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', full_text):
         return False, "Proibido partilhar emails."
-    
-    # 3. Detetor de Números (MODO AGRESSIVO)
-    # Remove TUDO o que não é dígito (espaços, pontos, letras, emojis)
-    # Ex: "9 . 1 . 2" vira "912"
     digits_only = re.sub(r'\D', '', full_text)
-    
-    # Se no total acumulado existirem 9 ou mais dígitos, e começar por 9, 2 ou 3 (indicativos PT), bloqueia.
-    # Isto apanha alguém que escreva um número dígito a dígito ao longo de 9 mensagens.
     if len(digits_only) >= 9:
-        # Verifica se parece um número de telefone PT (Começa por 9 ou 2)
-        # Se tivermos 9 digitos acumulados e o primeiro for 9 ou 2, é quase certo que é telefone.
         if digits_only[0] in ['9', '2', '3']:
-             return False, "Proibido partilhar contactos telefónicos (detetado padrão numérico)."
-    
-    # 4. Números por extenso (Lógica de Texto)
-    normalized = re.sub(r'[^\w\s]', '', full_text.lower())
-    numeros_extenso = ["zero", "um", "dois", "tres", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
-    
-    words = normalized.split()
-    count_seq = 0
-    for w in words:
-        if w in numeros_extenso:
-            count_seq += 1
-        elif len(w) > 2: 
-             count_seq = 0 # Reset apenas se for palavra relevante não numérica
-        
-        # Se detetar 3 números por extenso seguidos ("nove um dois"), bloqueia
-        if count_seq >= 3: 
-            return False, "Proibido partilhar sequências numéricas por extenso."
-            
+             return False, "Proibido partilhar contactos telefónicos."
     return True, ""
 
 # ==============================================================================
 # 3. DADOS E STATE
 # ==============================================================================
-USERS_DB = {
-    "cliente@email.com": {"pass": "123", "role": "Cliente", "nome": "Família Rodrigues"},
-    "baba@email.com":    {"pass": "123", "role": "Babysitter", "nome": "Maria Oliveira"},
-    "admin@email.com":   {"pass": "admin", "role": "Admin", "nome": "Administrador"}
-}
-
 keys_defaults = [
-    ('logged_in', False), ('user_role', None), ('user_name', None), ('user_email', None), 
+    ('logged_in', False), ('user_role', None), ('user_name', None), 
+    ('user_email', None), ('user_id', None),
     ('current_page', "Dashboard"), ('booking_step', 1), ('temp_booking_data', {}),
     ('active_chat_user', None), ('checkout_data', None), 
     ('cal_year', datetime.now().year), ('cal_month', datetime.now().month),
-    ('selected_history_service', None)
+    ('selected_history_service', None), ('mensagens', [])
 ]
 for k, v in keys_defaults:
     if k not in st.session_state: st.session_state[k] = v
-
-if 'initialized' not in st.session_state:
-    st.session_state['babysitters'] = pd.DataFrame({
-        'Nome': ['Ana Silva', 'Maria Oliveira', 'Joana Santos', 'Beatriz Costa'],
-        'Avaliação': [4.8, 4.9, 4.5, 5.0],
-        'Preço/Hora': [35.0, 45.0, 30.0, 50.0],
-        'Localização': ['Lisboa', 'Porto', 'Lisboa', 'Coimbra'],
-        'Bio': [
-            "Educadora de infância com 5 anos de experiência.",
-            "Enfermeira pediátrica com curso de primeiros socorros.",
-            "Estudante de psicologia, muito paciente.",
-            "Mãe experiente em recém-nascidos."
-        ],
-        'Foto': ['https://api.dicebear.com/7.x/avataaars/svg?seed=Ana', 
-                 'https://api.dicebear.com/7.x/avataaars/svg?seed=Maria',
-                 'https://api.dicebear.com/7.x/avataaars/svg?seed=Joana',
-                 'https://api.dicebear.com/7.x/avataaars/svg?seed=Beatriz']
-    })
-    
-    hoje = datetime.now().date()
-    st.session_state['agendamentos'] = pd.DataFrame({
-        'Data': [hoje, hoje + timedelta(days=2), hoje - timedelta(days=5)],
-        'Hora': [dt_time(14, 0), dt_time(18, 30), dt_time(9, 0)],
-        'Local': ['Av. da Liberdade, Lisboa', 'Rua do Ouro, Porto', 'Parque das Nações, Lisboa'],
-        'Babysitter': ['Maria Oliveira', 'Ana Silva', 'Joana Santos'],
-        'Cliente': ['Família Rodrigues', 'Família Costa', 'Família Rodrigues'],
-        'Status': ['Confirmado', 'Pendente', 'Concluído'],
-        'Valor': [135.00, 70.00, 90.00]
-    })
-    
-    st.session_state['mensagens'] = [
-        {"from": "cliente@email.com", "to": "baba@email.com", "content": "Olá! Disponível sexta?"},
-        {"from": "baba@email.com", "to": "cliente@email.com", "content": "Sim, a partir das 18h."}
-    ]
-    
-    st.session_state['notifications'] = [
-        {"msg": "Maria Oliveira aceitou o seu pedido.", "time": "10 min atrás"}
-    ]
-    st.session_state['initialized'] = True
 
 # ==============================================================================
 # 4. SISTEMA DE NAVEGAÇÃO
@@ -253,11 +199,13 @@ def login_page():
             password = st.text_input("Senha", type="password")
             submit = st.form_submit_button("Entrar", use_container_width=True)
         if submit:
-            if email in USERS_DB and USERS_DB[email]["pass"] == password:
+            user_data = db.verify_login(email, password)
+            if user_data:
                 st.session_state['logged_in'] = True
-                st.session_state['user_email'] = email
-                st.session_state['user_role'] = USERS_DB[email]["role"]
-                st.session_state['user_name'] = USERS_DB[email]["nome"]
+                st.session_state['user_email'] = user_data['email']
+                st.session_state['user_role'] = user_data['role']
+                st.session_state['user_name'] = user_data['name']
+                st.session_state['user_id'] = user_data['id'] 
                 go_to_page("Dashboard", reset_step=True)
             else: st.error("Credenciais inválidas.")
 
@@ -271,37 +219,163 @@ def render_navbar(menu_options):
         with col_user:
             c_name, c_notif, c_logout = st.columns([2, 1, 1])
             c_name.write(f"👤 **{st.session_state['user_name'].split()[0]}**")
-            notifs = st.session_state.get('notifications', [])
-            has_new = len(notifs) > 0
-            icon_label = "🔔 🧷" if has_new else "🔔"
-            with c_notif:
-                with st.popover(icon_label, use_container_width=True):
-                    st.markdown("#### Notificações")
-                    if not notifs: st.info("Tudo limpo!")
-                    else:
-                        for n in notifs: st.info(f"**{n['msg']}**\n\n*{n['time']}*")
-                        if st.button("Limpar Tudo"): st.session_state['notifications'] = []; st.rerun()
+            c_notif.write("")
             if c_logout.button("Sair"): st.session_state['logged_in'] = False; st.rerun()
         st.divider()
     if st.session_state['current_page'] != "Dashboard" and st.session_state['current_page'] not in menu_options:
         if st.button("⬅ Voltar ao Dashboard"): go_to_page("Dashboard", reset_step=True)
 
 # ==============================================================================
-# 5. DASHBOARD CLIENTE
+# 5. DASHBOARDS (COM TEMPO REAL E EXTENSÕES)
 # ==============================================================================
 def page_dashboard_cliente():
     st.header(f"Olá, {st.session_state['user_name']}")
-    df = st.session_state['agendamentos']
-    meus_pedidos = df[df['Cliente'] == st.session_state['user_name']]
-    hoje = datetime.now().date()
-    pedidos_futuros = meus_pedidos[meus_pedidos['Data'] >= hoje]
-    pedidos_passados = meus_pedidos[meus_pedidos['Data'] < hoje].sort_values(by='Data', ascending=False)
+    
+    # --- O CÓDIGO TEM DE ESTAR ALINHADO AQUI ---
+    # VERIFICAR SE HÁ MENSAGENS (Notificação)
+    try:
+        conn = db.get_connection()
+        # A linha que deu erro tem de estar encostada a este nível de indentação
+        msgs = pd.read_sql("SELECT * FROM messages ORDER BY timestamp DESC LIMIT 1", conn)
+        conn.close()
+        
+        if not msgs.empty:
+            # ... resto da lógica ...
+            pass
+    except Exception:
+        pass
+    
+    # 1. VERIFICAR SE EXISTE SERVIÇO EM CURSO
+    active_job = db.get_upcoming_or_active_booking(st.session_state['user_id'], 'Cliente')
+    
+    if active_job and active_job['status'] == 'Em Curso':
+        mins_left, progress, end_str = calculate_time_remaining(active_job)
+        
+        # --- CÁLCULOS FINANCEIROS ---
+        pending = active_job.get('pending_extension', 0)
+        extra_min = active_job.get('extension_minutes', 0)
+        total_price = active_job.get('total_price', 0.0)
+        
+        # Card Principal (Timer)
+        with st.container(border=True):
+            col_timer, col_actions = st.columns([1.5, 1])
+            with col_timer:
+                st.subheader("Monitorização em Tempo Real")
+                st.markdown(f"<h1 style='color:#FF4B4B; margin:0'>{mins_left} min</h1>", unsafe_allow_html=True)
+                st.caption(f"Previsão de fim: {end_str}")
+                st.progress(max(0.0, min(1.0, progress)))
+                
+                # [NOVO] CARD DE CONFIRMAÇÃO DE PAGAMENTO
+                # Só aparece se houver extensões aprovadas
+                if extra_min > 0:
+                    st.markdown("---")
+                    st.success(f"✅ **Extensão de +{extra_min} min Confirmada!**")
+                    with st.expander("💳 Recibo Atualizado (Débito Automático)", expanded=True):
+                        c_a, c_b = st.columns(2)
+                        c_a.write("Total Base:")
+                        c_b.write(f"€ {(total_price - (extra_min/60)*10):.2f}") # Estimativa base
+                        
+                        c_a.write(f"**Extra (+{extra_min} min):**")
+                        c_b.write(f"**€ {((extra_min/60)*10):.2f}**")
+                        
+                        st.divider()
+                        c_a.write("**TOTAL PAGO:**")
+                        c_b.write(f"**€ {total_price:.2f}**")
+
+            with col_actions:
+                st.markdown("### Ações")
+                
+                if st.button("💬 Chat com Babysitter", type="primary", use_container_width=True):
+                    st.session_state['active_chat_user'] = active_job['BabysitterEmail']
+                    st.session_state['current_page'] = "Mensagens"
+                    st.rerun()
+                
+                st.divider()
+                
+                # BOTÃO DE PEDIDO
+                if pending > 0:
+                     st.warning(f"⏳ Aguardando aprovação (+{pending} min)")
+                     st.caption("O débito será feito após aceitação.")
+                else:
+                    st.write("**Precisa de mais tempo?**")
+                    preco_hora = active_job.get('price_per_hour', 10.0)
+                    custo_15min = preco_hora / 4
+                    
+                    if st.button(f"➕ Pedir +15 min (+€{custo_15min:.2f})", use_container_width=True):
+                        db.request_extension_db(active_job['id'], 15)
+                        st.toast("Pedido enviado!")
+                        time.sleep(1)
+                        st.rerun()
+
+        st.markdown("---")
+        
+        # AUTO-REFRESH (A cada 10s verifica se a Babysitter aceitou)
+        time.sleep(10)
+        st.rerun()
+
+    # 2. DASHBOARD NORMAL (Sem serviço ativo)
+    else:
+        df = db.get_user_bookings(st.session_state['user_id'], 'Cliente')
+        if df.empty:
+            pedidos_passados = pd.DataFrame(); pedidos_futuros = pd.DataFrame()
+            count_passados = 0; count_futuros = 0
+        else:
+            hoje = datetime.now().date()
+            df['Data'] = pd.to_datetime(df['service_date']).dt.date
+            pedidos_futuros = df[df['Data'] >= hoje]
+            pedidos_passados = df[df['Data'] < hoje]
+            count_passados = len(pedidos_passados); count_futuros = len(pedidos_futuros)
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Serviços Realizados", count_passados)
+        c2.metric("Pedidos Futuros", count_futuros)
+        c3.metric("Mensagens", "0") 
+
+        col_new, col_history = st.columns(2)
+        with col_new:
+            with st.container(border=True):
+                st.subheader("➕ Novo Pedido Rápido")
+                st.write("Definir data e encontrar babysitter.")
+                if st.button("Criar Novo Pedido", use_container_width=True, type="primary"): 
+                    go_to_page("Novo Serviço", reset_step=True) 
+        
+        with col_history:
+            with st.container(border=True):
+                st.subheader("📜 Histórico Recente")
+                if pedidos_passados.empty: st.info("Ainda não tem histórico.")
+                else:
+                    for idx, row in pedidos_passados.head(3).iterrows():
+                        with st.container(border=True):
+                            col_info, col_act = st.columns([3, 1])
+                            with col_info:
+                                st.write(f"**{row['Babysitter']}**")
+                                st.caption(f"📅 {row['Data'].strftime('%d/%m/%Y')} | € {row['Valor']:.2f}")
+                            with col_act:
+                                if st.button("📄", key=f"hist_{idx}"):
+                                    st.session_state['selected_history_service'] = row.to_dict()
+                                    go_to_page("Detalhes Serviço")
+        
+        st.markdown("---")
+        st.subheader("📅 Próximos Pedidos")
+        if pedidos_futuros.empty: st.info("Não tem pedidos agendados.")
+        else: st.dataframe(pedidos_futuros[['Data', 'Hora', 'Babysitter', 'Status', 'Valor']], use_container_width=True, hide_index=True)
+
+    # 2. DASHBOARD NORMAL
+    df = db.get_user_bookings(st.session_state['user_id'], 'Cliente')
+    if df.empty:
+        pedidos_passados = pd.DataFrame(); pedidos_futuros = pd.DataFrame()
+        count_passados = 0; count_futuros = 0
+    else:
+        hoje = datetime.now().date()
+        df['Data'] = pd.to_datetime(df['service_date']).dt.date
+        pedidos_futuros = df[df['Data'] >= hoje]
+        pedidos_passados = df[df['Data'] < hoje]
+        count_passados = len(pedidos_passados); count_futuros = len(pedidos_futuros)
     
     c1, c2, c3 = st.columns(3)
-    c1.metric("Serviços Realizados", len(pedidos_passados))
-    c2.metric("Pedidos Futuros", len(pedidos_futuros))
-    c3.metric("Mensagens Novas", 2) 
-    st.markdown("---")
+    c1.metric("Serviços Realizados", count_passados)
+    c2.metric("Pedidos Futuros", count_futuros)
+    c3.metric("Mensagens", "0") 
 
     col_new, col_history = st.columns(2)
     with col_new:
@@ -324,44 +398,121 @@ def page_dashboard_cliente():
                             st.caption(f"📅 {row['Data'].strftime('%d/%m/%Y')} | € {row['Valor']:.2f}")
                         with col_act:
                             if st.button("📄 Detalhes", key=f"hist_{idx}"):
-                                st.session_state['selected_history_service'] = row
+                                st.session_state['selected_history_service'] = row.to_dict()
                                 go_to_page("Detalhes Serviço")
-                if len(pedidos_passados) > 3: st.caption("Mostrando os 3 mais recentes.")
     
     st.markdown("---")
     st.subheader("📅 Próximos Pedidos")
     if pedidos_futuros.empty: st.info("Não tem pedidos agendados.")
     else: st.dataframe(pedidos_futuros[['Data', 'Hora', 'Babysitter', 'Status', 'Valor']], use_container_width=True, hide_index=True)
 
-# ==============================================================================
-# 5.1. DETALHES DO SERVIÇO (COM PDF)
-# ==============================================================================
-def page_detalhes_servico():
-    st.title("Detalhes do Serviço")
-    servico = st.session_state.get('selected_history_service')
-    if servico is None: st.error("Nenhum serviço selecionado."); return
 
-    with st.container(border=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Informação do Profissional")
-            st.write(f"**Babysitter:** {servico['Babysitter']}")
-            st.write(f"**Status:** {servico['Status']}")
-        with c2:
-            st.subheader("Detalhes do Agendamento")
-            st.write(f"**Data:** {servico['Data'].strftime('%d/%m/%Y')}")
-            hora_str = servico['Hora'].strftime('%H:%M') if isinstance(servico.get('Hora'), dt_time) else "N/A"
-            st.write(f"**Hora:** {hora_str}")
-            st.write(f"**Local:** {servico.get('Local', 'N/A')}")
-        st.divider()
-        st.markdown(f"### Valor Total: € {servico['Valor']:.2f}")
-        st.write("")
+def page_dashboard_babysitter():
+    st.header(f"🧸 Painel Babysitter: {st.session_state['user_name']}")
+    
+    conn = db.get_connection()
+    msgs = pd.read_sql("SELECT * FROM messages ORDER BY timestamp DESC LIMIT 1", conn)
+    conn.close()
+    
+    if not msgs.empty:
+        last_msg_time = pd.to_datetime(msgs.iloc[0]['timestamp'])
+        # Se a mensagem tem menos de 2 minutos e não fui eu que enviei
+        if (datetime.now() - last_msg_time).total_seconds() < 120 and msgs.iloc[0]['sender_email'] != st.session_state['user_email']:
+             st.info(f"📨 **Nova mensagem de {msgs.iloc[0]['sender_email']}!** Vá ao menu Mensagens.")
+    # 1. BUSCAR DADOS (Query fresca)
+    active_job = db.get_upcoming_or_active_booking(st.session_state['user_id'], 'Babysitter')
+    
+    if active_job:
+        status = active_job['status']
         
-        if st.button("📄 Gerar Fatura (PDF)", type="primary"):
-            pdf_bytes = create_pdf_invoice(servico)
-            b64 = base64.b64encode(pdf_bytes).decode()
-            href = f'<a href="data:application/octet-stream;base64,{b64}" download="Fatura.pdf">Clique aqui para descarregar o PDF</a>'
-            st.markdown(href, unsafe_allow_html=True)
+        # --- AQUI ESTÁ A CORREÇÃO DO POP-UP ---
+        # Verificamos sempre se há pedidos pendentes, independentemente do status
+        pending = active_job.get('pending_extension', 0)
+        
+        if pending > 0:
+            # POP-UP VISUAL DE ALERTA
+            with st.container(border=True):
+                st.error(f"🔔 **PEDIDO URGENTE:** Os pais querem +{pending} minutos!")
+                c1, c2 = st.columns(2)
+                if c1.button("✅ ACEITAR MUDANÇA", use_container_width=True):
+                    custo_extra = (pending / 60) * 10.0
+                    db.resolve_extension_db(active_job['id'], True, pending, custo_extra)
+                    st.success("Aceite!"); time.sleep(1); st.rerun()
+                if c2.button("❌ RECUSAR MUDANÇA", use_container_width=True):
+                    db.resolve_extension_db(active_job['id'], False, 0, 0)
+                    st.error("Recusado."); time.sleep(1); st.rerun()
+        # ---------------------------------------
+
+        # A) PRÉ-SERVIÇO
+        if status == 'Confirmado':
+            job_dt = datetime.combine(active_job['Data'], active_job['Hora'])
+            diff = (job_dt - datetime.now()).total_seconds() / 60 
+            
+            with st.container(border=True):
+                st.subheader("🚀 Próximo Serviço")
+                st.write(f"**Cliente:** {active_job.get('ClientName')}")
+                st.write(f"**Horário:** {active_job['Hora'].strftime('%H:%M')}")
+                
+                if diff <= 15: 
+                    st.success("Pode iniciar.")
+                    with st.form("checkin_form"):
+                        febre = st.toggle("Febre?")
+                        marcas = st.text_area("Marcas?", placeholder="Descreva...")
+                        if st.form_submit_button("▶️ INICIAR", type="primary", use_container_width=True):
+                            db.start_service_db(active_job['id'], f"Febre:{febre}|Marcas:{marcas}")
+                            st.rerun()
+                else: st.warning(f"Check-in brevemente ({int(diff)} min).")
+            
+            # Refresh lento (30s) enquanto espera
+            time.sleep(30)
+            st.rerun()
+
+        # B) EM SERVIÇO
+        elif status == 'Em Curso':
+            mins_left, progress, end_str = calculate_time_remaining(active_job)
+            st.markdown(f"""
+            <div style="background-color: #e3f2fd; padding: 20px; border-radius: 10px; border: 2px solid #2196f3; text-align: center; margin-bottom: 20px;">
+                <h2 style="color: #1565c0; margin:0;">EM SERVIÇO 🟢</h2>
+                <h1 style="font-size: 50px; margin: 0;">{mins_left} min</h1>
+                <p>Restantes • Termina às {end_str}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.progress(max(0.0, min(1.0, progress)))
+            
+            if st.button("💬 Chat com Pais", use_container_width=True):
+                st.session_state['active_chat_user'] = active_job['ClientEmail']
+                st.session_state['current_page'] = "Mensagens"
+                st.rerun()
+            
+            st.divider()
+            
+            # --- CORREÇÃO: REFRESH RÁPIDO (5s) ---
+            # Isto garante que ela vê os pedidos de extensão quase logo que acontecem
+            time.sleep(5)
+            st.rerun()
+
+    # 2. AGENDA
+    df = db.get_user_bookings(st.session_state['user_id'], 'Babysitter')
+    if df.empty: st.info("Sem agenda.")
+    else: 
+        cols = [c for c in ['Data', 'Hora', 'Cliente', 'Status', 'Local', 'Valor'] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True)
+
+
+def page_admin_dashboard():
+    st.header("🔐 Painel Admin Global")
+    conn = db.get_connection()
+    df_users = pd.read_sql("SELECT * FROM users", conn)
+    df_bookings = pd.read_sql("SELECT * FROM bookings", conn)
+    conn.close()
+    
+    c1, c2 = st.columns(2)
+    c1.metric("Utilizadores Totais", len(df_users))
+    c2.metric("Reservas Totais", len(df_bookings))
+    
+    st.markdown("---")
+    st.subheader("Todas as Transações")
+    st.dataframe(df_bookings, use_container_width=True)
 
 # ==============================================================================
 # 6. WIZARD DE PEDIDOS
@@ -373,30 +524,22 @@ def page_novo_servico():
         st.header(" Passo 1 de 3: Detalhes do Serviço")
         st.progress(33)
         with st.form("form_step1"):
-            st.subheader("Quando e Quanto Tempo?")
             c1, c2 = st.columns(2)
             with c1: dt = st.date_input("Data de Início", min_value=datetime.now().date()); hr = st.time_input("Hora de Início")
             with c2: dur = st.number_input("Duração Estimada (horas)", min_value=1, value=3, step=1)
-            st.subheader("Quem vamos cuidar?")
             c3, c4 = st.columns(2)
             with c3: kids = st.number_input("Número de Crianças", min_value=1, value=1)
             with c4: idades = st.text_input("Idades das Crianças", placeholder="Ex: 3 anos, 5 anos")
-            st.subheader("Onde?")
-            st.info("⚠️ A morada deve ser válida para calcular a taxa de deslocação.")
             morada_rua = st.text_input("Local do Serviço (Rua e Número)")
             morada_cidade = st.text_input("Cidade / Localidade", value="Lisboa")
-            obs = st.text_area("Observações Adicionais", placeholder="Rotinas, alergias, etc.")
-            submit_step1 = st.form_submit_button("Validar e Procurar Babysitters ➡", type="primary", use_container_width=True)
-            if submit_step1:
+            obs = st.text_area("Observações Adicionais")
+            if st.form_submit_button("Validar e Procurar Babysitters ➡", type="primary", use_container_width=True):
                 if not morada_rua or not morada_cidade: st.error("Preencha a morada completa.")
                 else:
                     full_address = f"{morada_rua}, {morada_cidade}"
-                    with st.spinner("A validar morada..."):
-                        loc_obj = validate_address(full_address)
-                    if loc_obj is None: st.error("❌ Morada não encontrada ou inválida.")
+                    with st.spinner("A validar morada..."): loc_obj = validate_address(full_address)
+                    if loc_obj is None: st.error("❌ Morada inválida.")
                     else:
-                        st.success("✅ Morada validada com sucesso!")
-                        time.sleep(0.5)
                         st.session_state['temp_booking_data'] = {'data': dt, 'hora': hr, 'duracao': dur, 'criancas': kids, 'idades': idades, 'morada': full_address, 'obs': obs, 'location_obj': loc_obj}
                         st.session_state['booking_step'] = 2
                         st.rerun()
@@ -407,18 +550,17 @@ def page_novo_servico():
         st.progress(66)
         if st.button("⬅ Voltar"): st.session_state['booking_step'] = 1; st.rerun()
         st.divider()
-        disponiveis = get_available_babysitters(data_pedido['data'])
-        if disponiveis.empty: st.warning("Não existem babysitters disponíveis para esta data.")
+        disponiveis = db.get_all_babysitters()
+        if disponiveis.empty: st.warning("Não existem babysitters registadas.")
         else:
             for idx, row in disponiveis.iterrows():
                 with st.container(border=True):
                     c_img, c_info, c_btn = st.columns([1, 4, 1.5])
-                    with c_img: st.image(row['Foto'], width=100)
+                    foto = row['Foto'] if row['Foto'] else "https://via.placeholder.com/150"
+                    with c_img: st.image(foto, width=100)
                     with c_info: 
                         primeiro_nome = row['Nome'].split()[0]
-                        st.subheader(primeiro_nome)
-                        st.write(f"📝 *{row['Bio']}*")
-                        st.caption(f"📍 {row['Localização']} | ⭐ {row['Avaliação']}")
+                        st.subheader(primeiro_nome); st.write(f"📝 *{row['Bio']}*"); st.caption(f"📍 {row['Localização']} | ⭐ {row['Avaliação']}")
                     with c_btn:
                         st.write(""); st.write("")
                         if st.button("Selecionar ✅", key=f"select_{idx}", type="primary", use_container_width=True):
@@ -430,222 +572,140 @@ def page_novo_servico():
     elif step == 3:
         st.header("Passo 3 de 3: Pagamento Seguro")
         st.progress(100)
-        if st.button("⬅ Voltar à seleção"): st.session_state['booking_step'] = 2; st.rerun()
+        if st.button("⬅ Voltar"): st.session_state['booking_step'] = 2; st.rerun()
         data = st.session_state.get('checkout_data')
         if not data: st.error("Erro de dados."); st.stop()
         calc = data['calculo']
         baba_nome = data['babysitter_primeiro_nome']
-        c_resumo, c_pagamento = st.columns([1.5, 2])
-        with c_resumo:
+        c_res, c_pag = st.columns([1.5, 2])
+        with c_res:
             with st.container(border=True):
-                st.subheader("Resumo do Serviço")
+                st.subheader("Resumo")
                 st.write(f"**Babysitter:** {baba_nome}")
                 st.write(f"**Data:** {data['data'].strftime('%d/%m/%Y')} às {data['hora'].strftime('%H:%M')}")
                 st.write(f"**Local:** {data['morada']}")
                 st.divider()
                 st.write(f"Serviço: € {calc['custo_servico']:.2f}")
                 st.write(f"Deslocação: € {calc['custo_deslocacao']:.2f}")
-                st.markdown(f"### Total a Pagar: € {calc['total']:.2f}")
-        with c_pagamento:
-            st.subheader("Escolha o Método")
-            metodo = st.radio("Método", ["MBWAY", "Cartão de Crédito", "Revolut"], horizontal=True)
-            if metodo == "MBWAY": st.text_input("Nº Telemóvel", placeholder="91xxxxxxx")
-            elif metodo == "Cartão de Crédito": st.text_input("Nº Cartão"); st.columns(2)[0].text_input("Validade"); st.columns(2)[1].text_input("CVV")
-            elif metodo == "Revolut": st.info("Utilize o Revolut Pay na próxima janela.")
+                st.markdown(f"### Total: € {calc['total']:.2f}")
+        with c_pag:
+            st.subheader("Pagamento")
+            st.radio("Método", ["MBWAY", "Cartão de Crédito"], horizontal=True)
             st.write("")
             if st.button(f"Pagar € {calc['total']:.2f} e Confirmar", type="primary", use_container_width=True):
                 with st.spinner("A processar pagamento..."):
-                    time.sleep(2) 
-                    novo = {'Data': data['data'], 'Hora': data['hora'], 'Local': data['morada'], 'Babysitter': data['babysitter']['Nome'], 'Cliente': st.session_state['user_name'], 'Status': 'Confirmado', 'Valor': calc['total']}
-                    st.session_state['agendamentos'] = pd.concat([st.session_state['agendamentos'], pd.DataFrame([novo])], ignore_index=True)
-                    st.toast(f"📧 Email de confirmação enviado para {st.session_state['user_email']}")
-                    st.balloons(); st.success("Reserva confirmada com sucesso!"); time.sleep(3)
-                    go_to_page("Dashboard", reset_step=True)
+                    time.sleep(1) 
+                    sucesso = db.create_booking(st.session_state['user_id'], data['babysitter'], data)
+                    if sucesso: st.balloons(); st.success("Reserva confirmada!"); time.sleep(2); go_to_page("Dashboard", reset_step=True)
+                    else: st.error("Erro ao gravar na base de dados.")
 
 # ==============================================================================
 # 7. CALENDÁRIO
 # ==============================================================================
 def page_calendario():
-    def change_month(amount):
-        st.session_state['cal_month'] += amount
-        if st.session_state['cal_month'] > 12: st.session_state['cal_month'] = 1; st.session_state['cal_year'] += 1
-        elif st.session_state['cal_month'] < 1: st.session_state['cal_month'] = 12; st.session_state['cal_year'] -= 1
-
     c_head, c_btn = st.columns([3, 1])
     role = st.session_state['user_role']
-    if role == 'Cliente':
-        c_head.title("Meus Pedidos")
-        c_btn.write(""); 
-        if c_btn.button("➕ Novo Pedido", type="primary", use_container_width=True): go_to_page("Novo Serviço", reset_step=True)
-    else:
-        c_head.title("Minha Agenda")
-        c_btn.write(""); 
-        if c_btn.button("➕ Nova Disponibilidade", type="primary", use_container_width=True): st.toast("Mock")
-
-    with st.container(border=True):
-        if role == 'Cliente':
-            cl = st.columns([2, 2, 5]); cl[0].markdown("🟦 **Serviço Agendado**"); cl[1].markdown("🟣 **Dia Atual**")
-        else:
-            cl = st.columns([1, 2, 2, 5]); cl[0].markdown("🟢 **Disponível**"); cl[1].markdown("🟦 **Serviço Agendado**"); cl[2].markdown("🟣 **Dia Atual**")
-    st.write("")
-
-    with st.container(border=True):
-        cp, cd, cn = st.columns([1, 6, 1])
-        if cp.button("← Anterior"): change_month(-1); st.rerun()
-        meses = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
-        cd.markdown(f"<h3 style='text-align: center; margin: 0;'>{meses[st.session_state['cal_month']]} {st.session_state['cal_year']}</h3>", unsafe_allow_html=True)
-        if cn.button("Próximo →"): change_month(1); st.rerun()
-
-    dias_semana = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]
-    cols_header = st.columns(7)
-    for i, dia in enumerate(dias_semana): cols_header[i].markdown(f"**{dia}**", unsafe_allow_html=True)
-
-    cal = calendar.monthcalendar(st.session_state['cal_year'], st.session_state['cal_month'])
-    hoje = datetime.now()
-    eh_mes_atual = (hoje.year == st.session_state['cal_year'] and hoje.month == st.session_state['cal_month'])
+    c_head.title("Calendário")
+    df = db.get_user_bookings(st.session_state['user_id'], role)
+    if not df.empty: df['Data'] = pd.to_datetime(df['service_date']).dt.date
     
-    df = st.session_state['agendamentos']
-    if role == 'Cliente': meus_jobs = df[df['Cliente'] == st.session_state['user_name']]
-    else: meus_jobs = df[df['Babysitter'].apply(lambda x: st.session_state['user_name'] in x)]
+    cal_year = st.session_state['cal_year']
+    cal_month = st.session_state['cal_month']
+    cal = calendar.monthcalendar(cal_year, cal_month)
+    hoje = datetime.now()
+
+    cp, cd, cn = st.columns([1, 6, 1])
+    if cp.button("←"): 
+        st.session_state['cal_month'] -= 1
+        if st.session_state['cal_month'] < 1: st.session_state['cal_month']=12; st.session_state['cal_year']-=1
+        st.rerun()
+    cd.markdown(f"<h3 style='text-align: center'>{calendar.month_name[cal_month]} {cal_year}</h3>", unsafe_allow_html=True)
+    if cn.button("→"):
+        st.session_state['cal_month'] += 1
+        if st.session_state['cal_month'] > 12: st.session_state['cal_month']=1; st.session_state['cal_year']+=1
+        st.rerun()
+
+    cols_header = st.columns(7)
+    for i, d in enumerate(["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]): cols_header[i].write(f"**{d}**")
 
     for week in cal:
         cols = st.columns(7)
         for i, day in enumerate(week):
             with cols[i]:
-                if day == 0: st.markdown("<div style='min-height: 110px;'></div>", unsafe_allow_html=True)
+                if day == 0: st.markdown("<div style='min-height: 80px;'></div>", unsafe_allow_html=True)
                 else:
-                    is_today = (eh_mes_atual and day == hoje.day)
-                    dia_class = "day-cell current-day" if is_today else "day-cell"
-                    data_atual = datetime(st.session_state['cal_year'], st.session_state['cal_month'], day).date()
-                    eventos_dia = meus_jobs[meus_jobs['Data'] == data_atual]
-                    
-                    events_html = ""
-                    for _, evt in eventos_dia.iterrows():
-                        css_class = "event-card past" if data_atual < hoje.date() else "event-card"
-                        hora_str = evt['Hora'].strftime('%H:%M') if isinstance(evt['Hora'], dt_time) else ""
-                        nome_display = evt['Babysitter'].split()[0] if role == 'Cliente' else evt['Cliente'].split()[0]
-                        events_html += f"<div class='{css_class}'><strong>{hora_str}</strong> {nome_display}<br><span style='font-size:9px; opacity:0.8;'>📍 {str(evt['Local'])[:10]}...</span></div>"
-                    st.markdown(f"<div class='{dia_class}'><span class='day-number'>{day}</span>{events_html}</div>", unsafe_allow_html=True)
+                    data_atual = datetime(cal_year, cal_month, day).date()
+                    eventos_html = ""
+                    if not df.empty:
+                        eventos_dia = df[df['Data'] == data_atual]
+                        for _, evt in eventos_dia.iterrows():
+                            nome = evt.get('Babysitter') if role == 'Cliente' else evt.get('Cliente')
+                            nome = nome.split()[0] if nome else "Serviço"
+                            eventos_html += f"<div class='event-card'>{nome}</div>"
+                    st.markdown(f"<div class='day-cell'><span class='day-number'>{day}</span>{eventos_html}</div>", unsafe_allow_html=True)
 
 # ==============================================================================
-# 8. PÁGINA: MENSAGENS (COM FILTRO E BLOQUEIO REFORÇADO)
+# 8. MENSAGENS (AGORA LIGADO À BASE DE DADOS)
 # ==============================================================================
 def page_mensagens():
     st.header("Mensagens")
     col_contacts, col_chat = st.columns([1, 2.5])
     user_email = st.session_state['user_email']
-    user_name = st.session_state['user_name']
-    hoje = datetime.now().date()
     
-    contacts_set = set()
-    for m in st.session_state['mensagens']:
-        if m['from'] == user_email: contacts_set.add(m['to'])
-        elif m['to'] == user_email: contacts_set.add(m['from'])
-    contact_list = list(contacts_set)
-
+    contacts = set()
+    if st.session_state['active_chat_user']: 
+        contacts.add(st.session_state['active_chat_user'])
+    
     with col_contacts:
-        with st.expander("➕ Nova Conversa", expanded=False):
-            df_agendas = st.session_state['agendamentos']
-            if st.session_state['user_role'] == 'Cliente':
-                futuros = df_agendas[(df_agendas['Cliente'] == user_name) & (df_agendas['Data'] >= hoje) & (df_agendas['Status'] != 'Concluído')]
-                opcoes = futuros['Babysitter'].unique()
-                mapa_nomes = {v['nome']: k for k, v in USERS_DB.items() if v['role'] == 'Babysitter'}
-            else:
-                futuros = df_agendas[(df_agendas['Babysitter'].apply(lambda x: user_name in x)) & (df_agendas['Data'] >= hoje)]
-                opcoes = futuros['Cliente'].unique()
-                mapa_nomes = {v['nome']: k for k, v in USERS_DB.items() if v['role'] == 'Cliente'}
-
-            selected_partner = st.selectbox("Escolha o destinatário:", opcoes, index=None, placeholder="Selecione...")
-            
-            if selected_partner:
-                partner_email = mapa_nomes.get(selected_partner)
-                if partner_email and st.button("Iniciar Conversa", type="primary"):
-                    st.session_state['active_chat_user'] = partner_email
-                    st.rerun()
-            elif len(opcoes) == 0:
-                st.caption("Não tem serviços futuros agendados.")
-
         with st.container(border=True):
-            st.subheader("💬 Conversas")
-            if not contact_list: st.info("Sem histórico.")
-            else:
-                for contact_email in contact_list:
-                    c_name = USERS_DB.get(contact_email, {}).get('nome', contact_email)
-                    if st.button(f"👤 {c_name}", key=f"chat_{contact_email}", use_container_width=True):
-                        st.session_state['active_chat_user'] = contact_email
-                        st.rerun()
+            st.subheader("Conversas")
+            if not contacts: st.info("Inicie pelo Dashboard.")
+            for c in contacts:
+                if st.button(f"📧 {c}", key=c, use_container_width=True): 
+                    st.session_state['active_chat_user'] = c; st.rerun()
 
     with col_chat:
-        active_user = st.session_state['active_chat_user']
+        active = st.session_state['active_chat_user']
         chat_container = st.container(border=True, height=550)
         
-        if not active_user:
-            with chat_container: st.markdown("<div style='text-align: center; margin-top: 150px; color: #ccc;'><h1>💭</h1><h3>Selecione uma conversa</h3></div>", unsafe_allow_html=True)
-        else:
-            can_send_message = False
-            active_name = USERS_DB.get(active_user, {}).get('nome', active_user)
-            df = st.session_state['agendamentos']
-            
-            if st.session_state['user_role'] == 'Cliente':
-                servico_valido = df[
-                    (df['Cliente'] == user_name) & 
-                    (df['Babysitter'] == active_name) & 
-                    (df['Data'] >= hoje) &
-                    (df['Status'] != 'Concluído')
-                ]
-            else:
-                servico_valido = df[
-                    (df['Babysitter'].apply(lambda x: user_name in x)) & 
-                    (df['Cliente'] == active_name) & 
-                    (df['Data'] >= hoje) &
-                    (df['Status'] != 'Concluído')
-                ]
-                
-            if not servico_valido.empty: can_send_message = True
-            
-            msgs = [m for m in st.session_state['mensagens'] if (m['from'] == user_email and m['to'] == active_user) or (m['from'] == active_user and m['to'] == user_email)]
+        if active:
+            # LER DA DB
+            historico = db.get_chat_history_db(user_email, active)
             
             with chat_container:
-                st.write(f"**A falar com:** {active_name}")
-                if not can_send_message: st.warning("🔒 Serviço terminado ou inexistente. Conversa em modo de leitura.")
-                st.divider()
-                for msg in msgs:
-                    with st.chat_message("user" if msg['from'] == user_email else "assistant"): st.write(msg['content'])
-            
-            if can_send_message:
-                if prompt := st.chat_input(f"Escreva para {active_name}..."):
-                    my_recent_msgs = [m['content'] for m in st.session_state['mensagens'] 
-                                      if m['from'] == user_email and m['to'] == active_user]
-                    history_txt = " ".join(my_recent_msgs[-20:]) if my_recent_msgs else "" # CONTEXTO AUMENTADO PARA 20
-                    
-                    is_safe, error_msg = check_safety_rules(prompt, history_txt)
-                    
-                    if is_safe:
-                        st.session_state['mensagens'].append({"from": user_email, "to": active_user, "content": prompt})
-                        st.rerun()
-                    else:
-                        st.error(f"🚫 Mensagem bloqueada: {error_msg}")
+                st.write(f"**A falar com:** {active}")
+                if not historico: st.caption("Inicie a conversa...")
+                
+                for sender, content, ts in historico:
+                    align = "user" if sender == user_email else "assistant"
+                    with st.chat_message(align): 
+                        st.write(content)
+                        # Mostra hora (HH:MM)
+                        ts_str = str(ts)
+                        hora = ts_str[11:16] if len(ts_str) > 16 else ""
+                        st.caption(hora)
 
+            # ENVIAR
+            if prompt := st.chat_input("Escreva aqui..."):
+                safe, err = check_safety_rules(prompt, "")
+                if safe:
+                    db.send_message_db(user_email, active, prompt)
+                    st.rerun()
+                else: st.error(err)
+            
+            # --- CORREÇÃO: AUTO-REFRESH DO CHAT ---
+            # Isto faz o chat atualizar sozinho a cada 2 segundos
+            time.sleep(2)
+            st.rerun()
+
+        else:
+            with chat_container:
+                st.markdown("<div style='text-align:center;margin-top:100px;color:#ccc'><h3>Selecione uma conversa</h3></div>", unsafe_allow_html=True)
 def page_editar_perfil():
     st.header("⚙️ Configurações de Perfil")
     c1, c2 = st.columns(2)
     with c1: st.text_input("Nome", value=st.session_state['user_name']); st.text_input("Email", value=st.session_state['user_email'], disabled=True)
     with c2: st.text_input("Telefone", "+351 ..."); st.button("Guardar Alterações")
-
-def page_dashboard_babysitter():
-    st.header(f"🧸 Painel Babysitter: {st.session_state['user_name']}")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Próximos Trabalhos", "3"); col2.metric("Ganhos (Mês)", "€ 450,00"); col3.metric("Avaliação Média", "4.9 ⭐")
-    st.divider()
-    st.subheader("🗓️ Minha Agenda")
-    st.dataframe(st.session_state['agendamentos'], use_container_width=True)
-
-def page_admin_dashboard():
-    st.header("🔐 Painel Admin Global")
-    c1, c2 = st.columns(2); c1.metric("Utilizadores Totais", len(USERS_DB)); c2.metric("Receita Total", "€ 1.250,00")
-    st.markdown("---")
-    st.subheader("Todas as Transações")
-    st.dataframe(st.session_state['agendamentos'], use_container_width=True)
 
 # ==============================================================================
 # 9. ROUTER
@@ -654,12 +714,8 @@ if not st.session_state['logged_in']:
     login_page()
 else:
     role = st.session_state['user_role']
-    if role == 'Cliente': menus = ["Dashboard", "Calendário", "Mensagens", "Editar Perfil"]
-    elif role == 'Babysitter': menus = ["Dashboard", "Calendário", "Mensagens", "Editar Perfil"]
-    else: menus = ["Dashboard", "Admin Global", "Mensagens"]
-
+    menus = ["Dashboard", "Calendário", "Mensagens", "Editar Perfil"] if role != 'Admin' else ["Dashboard"]
     render_navbar(menus)
-
     pg = st.session_state['current_page']
     if pg == "Dashboard":
         if role == 'Cliente': page_dashboard_cliente()
@@ -670,4 +726,3 @@ else:
     elif pg == "Calendário": page_calendario()
     elif pg == "Mensagens": page_mensagens()
     elif pg == "Editar Perfil": page_editar_perfil()
-    elif pg == "Admin Global": page_admin_dashboard()
